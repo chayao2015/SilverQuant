@@ -1,4 +1,3 @@
-import os
 import time
 import datetime
 import json
@@ -6,42 +5,20 @@ import pickle
 import random
 import threading
 import traceback
-import functools
-
-import pandas as pd
-
 from typing import Dict, Callable, Optional
 
+import pandas as pd
 from xtquant import xtdata
 
 from delegate.xt_delegate import XtDelegate
 from delegate.daily_history import DailyHistoryCache
+from delegate.daily_reporter import DailyReporter
 
-from tools.utils_basic import code_to_symbol
-from tools.utils_cache import StockNames, check_is_open_day, get_total_asset_increase
+from tools.utils_cache import StockNames, InfoItem, check_is_open_day, get_trading_date_list
 from tools.utils_cache import load_pickle, save_pickle, load_json, save_json
 from tools.utils_ding import BaseMessager
-from tools.utils_remote import DataSource, get_daily_history, qmt_quote_to_tick
-
-
-def check_open_day(func):
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        if not check_is_open_day(datetime.datetime.now().strftime('%Y-%m-%d')):
-            return                      # 非开放日直接 return，不执行函数
-        return func(*args, **kwargs)    # 开放日正常执行
-    return wrapper
-
-
-def colour_text(text: str, to_red: bool, to_green: bool):
-    color = '#3366FF'
-    # （红色RGB为：220、40、50，绿色RGB为：22、188、80）
-    if to_red:
-        color = '#DC2832'
-    if to_green:
-        color = '#16BC50'
-
-    return f'<font color="{color}">{text}</font>'
+from tools.utils_mootdx import get_tdxzip_history
+from tools.utils_remote import DataSource, ExitRight, get_daily_history, qmt_quote_to_tick
 
 
 class BaseSubscriber:
@@ -59,9 +36,10 @@ class XtSubscriber(BaseSubscriber):
         execute_strategy: Callable,         # 策略回调函数
         execute_interval: int = 1,          # 策略执行间隔，单位（秒）
         before_trade_day: Callable = None,  # 盘前函数
+        near_trade_begin: Callable = None,  # 盘后函数
         finish_trade_day: Callable = None,  # 盘后函数
         use_outside_data: bool = False,     # 默认使用原版 QMT data （定期 call 数据但不传入quotes）
-        use_ap_scheduler: bool = False,     # 默认使用旧版 schedule
+        use_ap_scheduler: bool = False,     # 默认使用旧版 schedule （尽可能向前兼容旧策略吧）
         ding_messager: BaseMessager = None,
         open_tick_memory_cache: bool = False,
         tick_memory_data_frame: bool = False,
@@ -72,15 +50,18 @@ class XtSubscriber(BaseSubscriber):
         self.account_id = '**' + str(account_id)[-4:]
         self.strategy_name = strategy_name
         self.delegate = delegate
+        if self.delegate is not None:
+            self.delegate.subscriber = self
 
         self.path_deal = path_deal
         self.path_assets = path_assets
 
         self.execute_strategy = execute_strategy
         self.execute_interval = execute_interval
-        self.before_trade_day = before_trade_day
-        self.finish_trade_day = finish_trade_day
-        self.ding_messager = ding_messager
+        self.before_trade_day = before_trade_day    # 提前准备某些耗时长的任务
+        self.near_trade_begin = near_trade_begin    # 有些数据临近开盘才更新，这里保证内存里的数据正确
+        self.finish_trade_day = finish_trade_day    # 盘后及时做一些总结汇报入库类的整理工作
+        self.messager = ding_messager
 
         self.lock_quotes_update = threading.Lock()  # 聚合实时打点缓存的锁
 
@@ -102,13 +83,51 @@ class XtSubscriber(BaseSubscriber):
 
         self.code_list = ['000001.SH']  # 默认只有上证指数
         self.stock_names = StockNames()
-        self.last_callback_time = datetime.datetime.now()
+        self.last_callback_time = datetime.datetime.now()       # 上次返回quotes 时间
+
+        # 这个成员变量区别于cache_history，保存全部股票的日线数据550天，cache_history只包含code_list中指定天数数据
+        self.history_day_klines : Dict[str, pd.DataFrame] = {}
+
+        self.__extend_codes = ['399001.SZ', '510230.SH', '512680.SH', '159915.SZ', '510500.SH',
+                               '588000.SH', '159101.SZ', '399006.SZ', '159315.SZ']
 
         self.use_outside_data = use_outside_data
         self.use_ap_scheduler = use_ap_scheduler
+        if self.use_outside_data:
+            self.use_ap_scheduler = True  # 如果use_outside_data 被设置为True，则需强制使用apscheduler
+
+        self.daily_reporter = DailyReporter(
+            self.account_id,
+            self.strategy_name,
+            self.delegate,
+            self.path_deal,
+            self.path_assets,
+            self.messager,
+            self.use_outside_data,
+            self.today_report_show_bank,
+        )
+
         if self.use_ap_scheduler:
             from apscheduler.schedulers.blocking import BlockingScheduler
-            self.scheduler = BlockingScheduler()
+            from apscheduler.executors.pool import ThreadPoolExecutor
+            executors = {
+                'default': ThreadPoolExecutor(32),
+            }
+            job_defaults = {
+                'coalesce': True,
+                'misfire_grace_time': 180,
+                'max_instances': 3
+            }
+            self.scheduler = BlockingScheduler(timezone='Asia/Shanghai', executors=executors, job_defaults=job_defaults)
+
+        if self.is_ticks_df:
+            self.tick_df_cols = ['time', 'price', 'high', 'low', 'volume', 'amount'] \
+                + [f'askPrice{i}' for i in range(1, 6)] \
+                + [f'askVol{i}' for i in range(1, 6)] \
+                + [f'bidPrice{i}' for i in range(1, 6)] \
+                + [f'bidVol{i}' for i in range(1, 6)]
+
+        self.curr_trade_date = '1990-12-19' #记录当前股票交易日期
 
     # -----------------------
     # 策略触发主函数
@@ -129,28 +148,31 @@ class XtSubscriber(BaseSubscriber):
         with self.lock_quotes_update:
             self.cache_quotes.update(quotes)  # 合并最新数据
 
-        if self.open_tick and (not self.quick_ticks):
-            self.record_tick_to_memory(quotes)  # 更全（默认：先记录再执行）
-
         # 执行策略
         if self.cache_limits['prev_seconds'] != curr_seconds:
             self.cache_limits['prev_seconds'] = curr_seconds
 
-            if int(curr_seconds) % self.execute_interval == 0:
-                print('.' if len(self.cache_quotes) > 0 else 'x', end='')  # 每秒钟开始的时候输出一个点
+            print_mark = '.' if len(self.cache_quotes) > 0 else 'x'
 
-                if self.execute_strategy(
-                    curr_date,      # str(%Y-%m-%d)
-                    curr_time,      # str(%H:%M)
-                    curr_seconds,   # str(%S)
-                    self.cache_quotes,
-                ):
+            if int(curr_seconds) % self.execute_interval == 0:
+                # 更全（默认：先记录再执行）
+                if self.open_tick and (not self.quick_ticks):
+                    self.record_tick_to_memory(self.cache_quotes)
+
+                # str(%Y-%m-%d) str(%H:%M) str(%S) dict(code: quotes)
+                is_clear = self.execute_strategy(curr_date, curr_time, curr_seconds, self.cache_quotes)
+
+                # 更快（先执行再记录）
+                if self.open_tick and self.quick_ticks:
+                    self.record_tick_to_memory(self.cache_quotes)
+
+                if is_clear:
                     with self.lock_quotes_update:
-                        if self.open_tick and self.quick_ticks:
-                            self.record_tick_to_memory(self.cache_quotes)  # 更快（先执行再记录）
                         self.cache_quotes.clear()  # execute_strategy() return True means need clear
 
-    def callback_run_no_quotes(self) -> None:
+                print(print_mark, end='')  # 每秒钟开始的时候输出一个点
+
+    def callback_run_no_quotes(self):
         if not check_is_open_day(datetime.datetime.now().strftime('%Y-%m-%d')):
             return
 
@@ -170,43 +192,38 @@ class XtSubscriber(BaseSubscriber):
             self.cache_limits['prev_seconds'] = curr_seconds
 
             if int(curr_seconds) % self.execute_interval == 0:
-                print('.' if len(self.cache_quotes) > 0 else 'x', end='')  # 每秒钟开始的时候输出一个点
+                print('.', end='')  # cache_quotes 肯定没数据，这里就是输出观察线程健康
+                # str(%Y-%m-%d), str(%H:%M), str(%S)
+                self.execute_strategy(curr_date, curr_time, curr_seconds, {})
 
-                self.execute_strategy(
-                    curr_date,  # str(%Y-%m-%d)
-                    curr_time,  # str(%H:%M)
-                    curr_seconds,  # str(%S)
-                    {},
-                )
-
-    def callback_open_no_quotes(self) -> None:
+    def callback_open_no_quotes(self):
         if not check_is_open_day(datetime.datetime.now().strftime('%Y-%m-%d')):
             return
 
-        if self.ding_messager is not None:
-            self.ding_messager.send_text_as_md(f'[{self.account_id}]{self.strategy_name}:开启')
+        if self.messager is not None:
+            self.messager.send_text_as_md(f'[{self.account_id}]{self.strategy_name}:开启')
         print('[启动策略]', end='')
 
-    def callback_close_no_quotes(self) -> None:
+    def callback_close_no_quotes(self):
         if not check_is_open_day(datetime.datetime.now().strftime('%Y-%m-%d')):
             return
 
         print('\n[关闭策略]')
-        if self.ding_messager is not None:
-            self.ding_messager.send_text_as_md(f'[{self.account_id}]{self.strategy_name}:结束')
+        if self.messager is not None:
+            self.messager.send_text_as_md(f'[{self.account_id}]{self.strategy_name}:结束')
 
     # -----------------------
     # 监测主策略执行
     # -----------------------
     def callback_monitor(self):
-        now = datetime.datetime.now()
-
-        if not check_is_open_day(now.strftime('%Y-%m-%d')):
+        if not check_is_open_day(datetime.datetime.now().strftime('%Y-%m-%d')):
             return
 
-        if now - self.last_callback_time > datetime.timedelta(minutes=1):
-            if self.ding_messager is not None:
-                self.ding_messager.send_text_as_md(
+        now = datetime.datetime.now()
+        callback_timedelta = (now - self.last_callback_time).total_seconds()
+        if callback_timedelta > 60:
+            if self.messager is not None:
+                self.messager.send_text_as_md(
                     f'[{self.account_id}]{self.strategy_name}:中断\n请检查QMT数据源 ',
                     alert=True,
                 )
@@ -222,10 +239,10 @@ class XtSubscriber(BaseSubscriber):
         if not check_is_open_day(datetime.datetime.now().strftime('%Y-%m-%d')):
             return
 
-        if self.ding_messager is not None:
-            self.ding_messager.send_text_as_md(f'[{self.account_id}]{self.strategy_name}:'
-                                               f'{"恢复" if resume else "启动"} {len(self.code_list) - 1}支')
-        print('[启动行情订阅]', end='')
+        if self.messager is not None:
+            self.messager.send_text_as_md(f'[{self.account_id}]{self.strategy_name}:'
+                                          f'{"恢复" if resume else "开启"} {len(self.code_list)}支')
+        print('[开启行情订阅]', end='')
         xtdata.enable_hello = False
         self.cache_limits['sub_seq'] = xtdata.subscribe_whole_quote(self.code_list, callback=self.callback_sub_whole)
 
@@ -235,10 +252,10 @@ class XtSubscriber(BaseSubscriber):
 
         if 'sub_seq' in self.cache_limits:
             xtdata.unsubscribe_quote(self.cache_limits['sub_seq'])
-            print('\n[关闭行情订阅]')
-            if self.ding_messager is not None:
-                self.ding_messager.send_text_as_md(f'[{self.account_id}]{self.strategy_name}:'
-                                                   f'{"暂停" if pause else "关闭"}')
+            print('\n[结束行情订阅]')
+            if self.messager is not None:
+                self.messager.send_text_as_md(f'[{self.account_id}]{self.strategy_name}:'
+                                              f'{"暂停" if pause else "关闭"}')
 
     def resubscribe_tick(self, notice: bool = False):
         if not check_is_open_day(datetime.datetime.now().strftime('%Y-%m-%d')):
@@ -249,14 +266,17 @@ class XtSubscriber(BaseSubscriber):
         self.cache_limits['sub_seq'] = xtdata.subscribe_whole_quote(self.code_list, callback=self.callback_sub_whole)
         xtdata.enable_hello = False
 
-        if self.ding_messager is not None and notice:
-            self.ding_messager.send_text_as_md(f'[{self.account_id}]{self.strategy_name}:'
-                                               f'重启 {len(self.code_list) - 1}支')
+        if self.messager is not None and notice:
+            self.messager.send_text_as_md(f'[{self.account_id}]{self.strategy_name}:'
+                                          f'重启 {len(self.code_list)}支')
         print('\n[重启行情订阅]', end='')
-    
+
     def update_code_list(self, code_list: list[str]):
         # 加上证指数防止没数据不打点
         self.code_list = ['000001.SH'] + code_list
+        extend = 10 - len(self.code_list)
+        if extend > 0:
+            self.code_list.extend(self.__extend_codes[:extend])  # 防止数据太少长时间不返回数据导致断流
 
     # -----------------------
     # 盘中实时的tick历史
@@ -264,18 +284,14 @@ class XtSubscriber(BaseSubscriber):
     def record_tick_to_memory(self, quotes):
         # 记录 tick 历史
         if self.is_ticks_df:
-            tick_df_cols = ['time', 'price', 'high', 'low', 'volume', 'amount'] \
-                + [f'askPrice{i}' for i in range(1, 6)] \
-                + [f'askVol{i}' for i in range(1, 6)] \
-                + [f'bidPrice{i}' for i in range(1, 6)] \
-                + [f'bidVol{i}' for i in range(1, 6)]
             for code in quotes:
-                if code not in self.today_ticks:
-                    self.today_ticks[code] = pd.DataFrame(columns=tick_df_cols)
                 quote = quotes[code]
                 tick = qmt_quote_to_tick(quote)
-                df = self.today_ticks[code]
-                df.loc[len(df)] = tick.values()     # 加入最后一行
+                new_tick_df = pd.DataFrame([tick], columns=self.tick_df_cols)
+                if code not in self.today_ticks:
+                    self.today_ticks[code] = new_tick_df
+                else:
+                    self.today_ticks[code] = pd.concat([self.today_ticks[code], new_tick_df], ignore_index=True)
         else:
             for code in quotes:
                 if code not in self.today_ticks:
@@ -299,6 +315,7 @@ class XtSubscriber(BaseSubscriber):
     def clean_ticks_history(self):
         if not check_is_open_day(datetime.datetime.now().strftime('%Y-%m-%d')):
             return
+
         self.today_ticks.clear()
         self.today_ticks = {}
         print(f"已清除tick缓存")
@@ -308,12 +325,12 @@ class XtSubscriber(BaseSubscriber):
             return
 
         if self.is_ticks_df:
-            pickle_file = './_cache/debug/tick_history.pkl'
+            pickle_file = f'./_cache/debug/tick_history_{self.strategy_name}.pkl'
             with open(pickle_file, 'wb') as f:
                 pickle.dump(self.today_ticks, f)
             print(f"当日tick数据已存储为 {pickle_file} 文件")
         else:
-            json_file = './_cache/debug/tick_history.json'
+            json_file = f'./_cache/debug/tick_history_{self.strategy_name}.json'
             with open(json_file, 'w') as file:
                 json.dump(self.today_ticks, file, indent=4)
             print(f"当日tick数据已存储为 {json_file} 文件")
@@ -321,23 +338,23 @@ class XtSubscriber(BaseSubscriber):
     # -----------------------
     # 盘前下载数据缓存
     # -----------------------
-    def download_from_remote(
+    def _download_from_remote(
         self,
         target_codes: list,
         start: str,
         end: str,
-        adjust: str,
+        adjust: ExitRight,
         columns: list[str],
-        data_source: int,
+        data_source: DataSource,
     ):
-        print(f'Prepared time range: {start} - {end}')
+        print(f'Prepared TIME RANGE: {start} - {end}')
         t0 = datetime.datetime.now()
+        print(f'Downloading {len(target_codes)} stocks:')
 
-        print(f'Downloading {len(target_codes)} stocks from {start} to {end} ...')
         group_size = 200
+        down_count = 0
         for i in range(0, len(target_codes), group_size):
             sub_codes = [sub_code for sub_code in target_codes[i:i + group_size]]
-            time.sleep(1)
             print(i, sub_codes)  # 已更新数量
 
             # TUSHARE 批量下载限制总共8000天条数据，所以暂时弃用
@@ -350,10 +367,30 @@ class XtSubscriber(BaseSubscriber):
             # 默认使用 AKSHARE 数据源
             for code in sub_codes:
                 df = get_daily_history(code, start, end, columns=columns, adjust=adjust, data_source=data_source)
+                time.sleep(0.5)
                 if df is not None:
                     self.cache_history[code] = df
-                if data_source == DataSource.TUSHARE:
-                    time.sleep(0.1)
+                    down_count += 1
+
+        print(f'Download completed with {down_count} stock histories succeed!')
+        t1 = datetime.datetime.now()
+        print(f'Prepared TIME COST: {t1 - t0}')
+
+    def _download_from_tdx(self, target_codes: list, start: str, end: str, adjust: str, columns: list[str]):
+        print(f'Prepared time range: {start} - {end}')
+        t0 = datetime.datetime.now()
+
+        full_history = get_tdxzip_history(adjust=adjust)
+        self.history_day_klines = full_history
+
+        days = len(get_trading_date_list(start, end))
+
+        i = 0
+        for code in target_codes:
+            if code in full_history:
+                i += 1
+                self.cache_history[code] = full_history[code][columns].tail(days).copy()
+        print(f'[HISTORY] Find {i}/{len(target_codes)} codes returned.')
 
         t1 = datetime.datetime.now()
         print(f'Prepared TIME COST: {t1 - t0}')
@@ -364,11 +401,12 @@ class XtSubscriber(BaseSubscriber):
         code_list: list[str],
         start: str,
         end: str,
-        adjust: str,
+        adjust: ExitRight,
         columns: list[str],
         data_source: DataSource,
     ):
-        if data_source == DataSource.AKSHARE:
+        # ======== 每日一次性全量数据源 ========
+        if data_source == DataSource.AKSHARE or data_source == DataSource.TDXZIP:
             temp_indicators = load_pickle(cache_path)
             if temp_indicators is not None and len(temp_indicators) > 0:
                 # 如果有缓存就读缓存
@@ -376,211 +414,151 @@ class XtSubscriber(BaseSubscriber):
                 self.cache_history = {}
                 self.cache_history.update(temp_indicators)
                 print(f'{len(self.cache_history)} histories loaded from {cache_path}')
-                if self.ding_messager is not None:
-                    self.ding_messager.send_text_as_md(f'[{self.account_id}]{self.strategy_name}:'
-                                                       f'历史{len(self.cache_history)}支')
+                if self.messager is not None:
+                    self.messager.send_text_as_md(f'[{self.account_id}]{self.strategy_name}:'
+                                                  f'历史{len(self.cache_history)}支')
             else:
                 # 如果没缓存就刷新白名单
                 self.cache_history.clear()
                 self.cache_history = {}
-                self.download_from_remote(code_list, start, end, adjust, columns, data_source)
+                if data_source == DataSource.AKSHARE:
+                    self._download_from_remote(code_list, start, end, adjust, columns, data_source)
+                else:
+                    print('[提醒] 使用TDX ZIP文件作为数据源，请在RUN代码中添加调度任务check_xdxr_cache更新除权除息数据，建议运行时段在05:30之后。')
+                    print('[提醒] 使用TDX ZIP文件作为数据源，请在RUN代码中建议在near_trade_begin中执行download_cache_history获取历史数据，避免before_trade_day执行时间太早未更新除权信息。')
+                    self._download_from_tdx(code_list, start, end, adjust, columns)
+
                 save_pickle(cache_path, self.cache_history)
                 print(f'{len(self.cache_history)} of {len(code_list)} histories saved to {cache_path}')
-                if self.ding_messager is not None:
-                    self.ding_messager.send_text_as_md(f'[{self.account_id}]{self.strategy_name}:'
-                                                       f'历史{len(self.cache_history)}支')
+                if self.messager is not None:
+                    self.messager.send_text_as_md(f'[{self.account_id}]{self.strategy_name}:'
+                                                  f'历史{len(self.cache_history)}支')
+
+            if data_source == DataSource.TDXZIP and self.history_day_klines is None:
+                self.history_day_klines = get_tdxzip_history(adjust=adjust)
+
+        # ======== 预加载每日增量数据源 ========
         elif data_source == DataSource.TUSHARE or data_source == DataSource.MOOTDX:
             hc = DailyHistoryCache()
             hc.set_data_source(data_source=data_source)
-            hc.daily_history.download_recent_daily(5)
+            if hc.daily_history is not None:
+                hc.daily_history.remove_recent_exit_right_histories(5)  # 一周数据
+                hc.daily_history.download_recent_daily(20)  # 一个月数据
+                # 下载后加载进内存
+                start_date = datetime.datetime.strptime(start, '%Y%m%d')
+                end_date = datetime.datetime.strptime(end, '%Y%m%d')
+                delta = abs(end_date - start_date)
+                self.cache_history = hc.daily_history.get_subset_copy(code_list, delta.days + 1)
+        else:
+            if self.messager is not None:
+                self.messager.send_text_as_md(f'[{self.account_id}]{self.strategy_name}:\n无法识别的数据源')
 
-            # 计算两个日期之间的差值
+    def refresh_memory_history(
+        self,
+        code_list: list[str],
+        start: str,
+        end: str,
+        data_source: DataSource,
+    ):
+        if not check_is_open_day(datetime.datetime.now().strftime('%Y-%m-%d')):
+            return
+
+        hc = DailyHistoryCache()
+        hc.set_data_source(data_source=data_source)
+        if hc.daily_history is not None:
+            # 重新加载进内存
             start_date = datetime.datetime.strptime(start, '%Y%m%d')
             end_date = datetime.datetime.strptime(end, '%Y%m%d')
             delta = abs(end_date - start_date)
-
             self.cache_history = hc.daily_history.get_subset_copy(code_list, delta.days + 1)
-            if self.ding_messager is not None:
-                self.ding_messager.send_text_as_md(f'[{self.account_id}]{self.strategy_name}:'
-                                                   f'加载历史{len(self.cache_history)}支')
-        else:
-            if self.ding_messager is not None:
-                self.ding_messager.send_text_as_md(f'[{self.account_id}]{self.strategy_name}:'
-                                                   f'无法识别数据源')
 
     # -----------------------
     # 盘后报告总结
     # -----------------------
     def daily_summary(self):
-        curr_date = datetime.datetime.now().strftime('%Y-%m-%d')
-        if not check_is_open_day(curr_date):
+        if not check_is_open_day(datetime.datetime.now().strftime('%Y-%m-%d')):
             return
 
-        try:
-            if self.open_today_deal_report:
-                self.today_deal_report(today=curr_date)
+        curr_date = datetime.datetime.now().strftime('%Y-%m-%d')
 
-            if self.delegate is not None:
-                if self.open_today_hold_report:
+        if self.open_today_deal_report:
+            try:
+                self.daily_reporter.today_deal_report(today=curr_date)
+            except Exception as e:
+                print('Report deal failed: ', e)
+                traceback.print_exc()
+
+        if self.open_today_hold_report:
+            try:
+                if self.delegate is not None:
                     positions = self.delegate.check_positions()
-                    self.today_hold_report(today=curr_date, positions=positions)
+                    self.daily_reporter.today_hold_report(today=curr_date, positions=positions)
+                else:
+                    print('Missing delegate to complete reporting!')
+            except Exception as e:
+                print('Report position failed: ', e)
+                traceback.print_exc()
 
+        try:
+            if self.delegate is not None:
                 asset = self.delegate.check_asset()
-                self.check_asset(today=curr_date, asset=asset)
-            else:
-                print('Missing delegate to complete reporting!')
+                self.daily_reporter.check_asset(today=curr_date, asset=asset)
         except Exception as e:
-            print('Report failed: ', e)
+            print('Report asset failed: ', e)
             traceback.print_exc()
 
-    def today_deal_report(self, today: str):
-        if not os.path.exists(self.path_deal):
-            print('Missing deal record file!')
-            title = f'[{self.account_id}]{self.strategy_name} 无委托记录'
-            text = f'{title}\n\n[{today}] 未交易'
-        else:
-            df = pd.read_csv(self.path_deal, encoding='gbk')
-            if '日期' in df.columns:
-                df = df[df['日期'] == today]
-
-            title = f'[{self.account_id}]{self.strategy_name} 委托统计'
-            text = f'{title}\n\n[{today}] 交易{len(df)}单'
-
-            if len(df) > 0:
-                for index, row in df.iterrows():
-                    # ['日期', '时间', '代码', '名称', '类型', '注释', '成交价', '成交量']
-                    text += '\n\n> '
-                    text += f'{row["时间"]} {row["注释"]} {code_to_symbol(row["代码"])} '
-                    text += '\n>\n> '
-                    text += f'{row["名称"]} {row["成交量"]}股 {row["成交价"]}元 '
-
-        if self.ding_messager is not None:
-            self.ding_messager.send_markdown(title, text)
-
-    def today_hold_report(self, today: str, positions):
-        text = ''
-        hold_count = 0
-        display_list = []
-
-        # 处理持仓数据
-        for position in positions:
-            if position.volume > 0:
-                code = position.stock_code
-                if self.use_outside_data:
-                    from tools.utils_remote import get_mootdx_quotes
-                    quotes = get_mootdx_quotes([code])
-                else:
-                    quotes = xtdata.get_full_tick([code])
-
-                curr_price = None
-                if (code in quotes) and ('lastPrice' in quotes[code]):
-                    curr_price = quotes[code]['lastPrice']
-
-                open_price = position.open_price
-                if open_price == 0.0 or curr_price is None:
-                    continue
-
-                vol = position.volume
-                total_change = curr_price - open_price
-                ratio_change = curr_price / open_price - 1
-                hold_count += 1
-                display_list.append([code, curr_price, vol, ratio_change, total_change])
-
-        sorted_list_desc = sorted(display_list, key=lambda x: x[3], reverse=True)
-
-        # 渲染输出内容
-        for i in range(hold_count):
-            [code, curr_price, vol, ratio_change, total_change] = sorted_list_desc[i]
-            total_change = colour_text(f"{total_change * vol:.2f}", total_change > 0, total_change < 0)
-            ratio_change = colour_text(f'{ratio_change * 100:.2f}%', ratio_change > 0, ratio_change < 0)
-
-            text += '\n\n>'
-            text += f'' \
-                    f'{code_to_symbol(code)} ' \
-                    f'{self.stock_names.get_name(code)} ' \
-                    f'{curr_price * vol:.2f}元'
-            text += '\n>\n>'
-            text += f'盈亏比: {ratio_change} 盈亏额: {total_change}'
-
-        title = f'[{self.account_id}]{self.strategy_name} 持仓统计'
-        text = f'{title}\n\n[{today}] 持仓{hold_count}支\n{text}'
-
-        if self.ding_messager is not None:
-            self.ding_messager.send_markdown(title, text)
-
-    def check_asset(self, today: str, asset):
-        title = f'[{self.account_id}]{self.strategy_name} 盘后清点'
-        text = title
-
-        increase = get_total_asset_increase(self.path_assets, today, asset.total_asset)
-        if increase is not None:
-            text += '\n>\n> '
-
-            total_change = colour_text(
-                f'{"+" if increase > 0 else ""}{round(increase, 2)}',
-                increase > 0,
-                increase < 0,
-            )
-            ratio_change = colour_text(
-                # (今日 - 昨日) / 昨日
-                f'{"+" if increase > 0 else ""}{round(increase * 100 / (asset.total_asset - increase), 2)}%',
-                increase > 0,
-                increase < 0,
-            )
-            text += f'当日变动: {total_change}元({ratio_change})'
-
-            if self.today_report_show_bank \
-                    and hasattr(self.delegate, 'xt_trader') \
-                    and hasattr(self.delegate.xt_trader, 'query_bank_info'):
-
-                cash_change = 0.0
-                today_xt = today.replace('-', '')
-                bank_info = self.delegate.xt_trader.query_bank_info(self.delegate.account)  # 银行信息查询
-                for bank in bank_info:
-                    if bank.success:
-                        # 银行卡流水记录查询
-                        transfers = self.delegate.xt_trader.query_bank_transfer_stream(
-                            self.delegate.account, today_xt, today_xt, bank.bank_no, bank.bank_account)
-                        total_change = sum(
-                            -t.balance
-                            if t.transfer_direction == '2' else t.balance
-                            for t in transfers if t.success
-                        )
-                        cash_change += total_change
-
-                if abs(cash_change) > 0.0001:
-                    cash_change = colour_text(
-                        f'{"+" if cash_change > 0 else ""}{round(cash_change, 2)}',
-                        cash_change > 0,
-                        cash_change < 0,
-                    )
-                    text += '\n>\n> '
-                    text += f'银证转账: {cash_change}元'
-
-        text += '\n>\n> '
-        text += f'持仓市值: {round(asset.market_value, 2)}元'
-
-        text += '\n>\n> '
-        text += f'剩余现金: {round(asset.cash, 2)}元'
-
-        text += f'\n>\n>'
-        text += f'资产总计: {round(asset.total_asset, 2)}元'
-
-        if self.ding_messager is not None:
-            self.ding_messager.send_markdown(title, text)
 
     # -----------------------
     # 定时器
     # -----------------------
-    @check_open_day
     def before_trade_day_wrapper(self):
+        if not check_is_open_day(datetime.datetime.now().strftime('%Y-%m-%d')):
+            return
+
+        self.cache_quotes.clear()
+        self.cache_history.clear()
+        self.today_ticks.clear()
+        self.history_day_klines.clear()
+        self.code_list = ['000001.SH']  # 默认只有上证指数
+
+
         if self.before_trade_day is not None:
             self.before_trade_day()
+            self.curr_trade_date = datetime.datetime.now().strftime('%Y-%m-%d')
 
-    @check_open_day
+    def near_trade_begin_wrapper(self):
+        if not check_is_open_day(datetime.datetime.now().strftime('%Y-%m-%d')):
+            return
+
+        if self.near_trade_begin is not None:
+            self.near_trade_begin()
+            if self.before_trade_day is None:  # 没有设置before_trade_day 情况
+                self.curr_trade_date = datetime.datetime.now().strftime('%Y-%m-%d')
+            print(f'今日盘前准备工作已完成')
+
     def finish_trade_day_wrapper(self):
+        if not check_is_open_day(datetime.datetime.now().strftime('%Y-%m-%d')):
+            return
+
         if self.finish_trade_day is not None:
             self.finish_trade_day()
+
+    # 检查是否完成盘前准备
+    # @check_open_day
+    def check_before_finished(self):
+        if not check_is_open_day(datetime.datetime.now().strftime('%Y-%m-%d')):
+            return
+
+        if (
+            self.before_trade_day is not None or self.near_trade_begin is not None
+        ) and (
+            self.curr_trade_date != datetime.datetime.now().strftime("%Y-%m-%d")
+            or len(self.cache_history) < 1
+        ):
+            print('[ERROR]盘前准备未完成，尝试重新执行盘前函数')
+            self.before_trade_day_wrapper()
+            self.near_trade_begin_wrapper()
+        print(f'当前交易日：[{self.curr_trade_date}]。')
 
     def start_scheduler_without_qmt_data(self):
         run_time_ranges = [
@@ -611,13 +589,17 @@ class XtSubscriber(BaseSubscriber):
         for idx, cron_params in enumerate(run_time_ranges):
             self.scheduler.add_job(self.callback_run_no_quotes, 'cron', **cron_params, id=f"run_{idx}")
 
-        if self.before_trade_day is not None:
-            self.scheduler.add_job(self.before_trade_day_wrapper, 'cron', hour=8, minute=random.randint(0, 25) + 5)
+        if self.before_trade_day is not None:   # 03:00 ~ 06:59
+            random_hour = random.randint(0, 3) + 3
+            random_minute = random.randint(0, 59)
+            self.scheduler.add_job(self.before_trade_day_wrapper, 'cron', hour=random_hour, minute=random_minute)
 
-        if self.finish_trade_day is not None:
-            self.scheduler.add_job(self.finish_trade_day_wrapper, 'cron', hour=16, minute=random.randint(0, 10) + 5)
+        if self.finish_trade_day is not None:   # 16:05 ~ 16:15
+            random_minute = random.randint(0, 10) + 5
+            self.scheduler.add_job(self.finish_trade_day_wrapper, 'cron', hour=16, minute=random_minute)
 
-        self.scheduler.add_job(prev_check_open_day, 'cron', hour=8, minute=0, second=0)
+        self.scheduler.add_job(self.prev_check_open_day, 'cron', hour=1, minute=0, second=0)
+        self.scheduler.add_job(self.check_before_finished, 'cron', hour=8, minute=55) # 检查当天是否完成准备
         self.scheduler.add_job(self.callback_open_no_quotes, 'cron', hour=9, minute=14, second=59)
         self.scheduler.add_job(self.callback_close_no_quotes, 'cron', hour=11, minute=30, second=0)
         self.scheduler.add_job(self.callback_open_no_quotes, 'cron', hour=12, minute=59, second=59)
@@ -625,42 +607,40 @@ class XtSubscriber(BaseSubscriber):
         self.scheduler.add_job(self.daily_summary, 'cron', hour=15, minute=1, second=0)
 
         try:
-            print('策略定时器任务已经启动！')
+            print('[定时器已启动]')
             self.scheduler.start()
         except KeyboardInterrupt:
-            print('手动结束进程，请检查缓存文件是否因读写中断导致空文件错误')
+            print('[手动结束进程]')
         except Exception as e:
             print('策略定时器出错：', e)
         finally:
             self.delegate.shutdown()
 
-    def start_scheduler(self):
-        if self.use_outside_data:
-            self.start_scheduler_without_qmt_data()
-            return
-
+    def start_scheduler_with_qmt_data(self):
         # 默认定时任务列表
         cron_jobs = [
-            ['08:00', prev_check_open_day, None],
-            ['09:15', self.subscribe_tick, None],
-            ['11:30', self.unsubscribe_tick, (True, )],
-            ['13:00', self.subscribe_tick, (True, )],
-            ['15:00', self.unsubscribe_tick, None],
-            ['15:01', self.daily_summary, None],
+            ['01:00', self.prev_check_open_day, None],
+            ['08:30', self.near_trade_begin_wrapper, None],
+            ['08:55', self.check_before_finished, None],
+            ['09:14', self.subscribe_tick, None],
+            ['11:31', self.unsubscribe_tick, (True, )],
+            ['12:59', self.subscribe_tick, (True, )],
+            ['15:01', self.unsubscribe_tick, None],
+            ['15:02', self.daily_summary, None],
         ]
         if self.open_tick:
             cron_jobs.append(['09:10', self.clean_ticks_history, None])
             cron_jobs.append(['15:10', self.save_tick_history, None])
 
         if self.before_trade_day is not None:
-            cron_jobs.append([
-                f'0{random.randint(0, 3) + 4}:{random.randint(0, 59)}',
+            cron_jobs.append([  # 03:00 ~ 06:59
+                f'0{random.randint(0, 3) + 3}:{random.randint(0, 59)}',
                 self.before_trade_day_wrapper,
                 None,
-            ])  # random时间为了跑多个策略时防止短期预加载数据流量压力过大
+            ])  # random 时间为了跑多个策略时防止短期预加载数据流量压力过大
 
         if self.finish_trade_day is not None:
-            cron_jobs.append([
+            cron_jobs.append([  # 16:05 ~ 16:15
                 f'16:{random.randint(0, 10) + 5}',
                 self.finish_trade_day_wrapper,
                 None,
@@ -673,11 +653,6 @@ class XtSubscriber(BaseSubscriber):
             '13:05', '13:15', '13:25', '13:35', '13:45', '13:55',
             '14:05', '14:15', '14:25', '14:35', '14:45', '14:55',
         ]
-
-        temp_now = datetime.datetime.now()
-        temp_date = temp_now.strftime('%Y-%m-%d')
-        temp_time = temp_now.strftime('%H:%M')
-
         if self.use_ap_scheduler:
             # 新版 apscheduler
             for cron_job in cron_jobs:
@@ -688,28 +663,28 @@ class XtSubscriber(BaseSubscriber):
                     self.scheduler.add_job(cron_job[1], 'cron', hour=hr, minute=mn, args=list(cron_job[2]))
 
             # 尝试重新订阅 tick 数据，减少30分时无数据返回机率
-            self.scheduler.add_job(self.resubscribe_tick, 'cron', hour=9, minute=29, second=30) 
+            self.scheduler.add_job(self.resubscribe_tick, 'cron', hour=9, minute=29, second=30)
 
             for monitor_time in monitor_time_list:
                 [hr, mn] = monitor_time.split(':')
                 self.scheduler.add_job(self.callback_monitor, 'cron', hour=hr, minute=mn)
 
-            # 盘中执行需要补齐
-            if '08:05' < temp_time < '15:30' and check_is_open_day(temp_date):
-                self.before_trade_day_wrapper()
-                if '09:15' < temp_time < '11:30' or '13:00' <= temp_time < '14:57':
-                    self.subscribe_tick()  # 重启时如果在交易时间则订阅Tick
-
             # 启动定时器
             try:
-                print('策略定时器任务已经启动！')
+                print('[定时器已启动]')
                 self.scheduler.start()
             except KeyboardInterrupt:
-                print('手动结束进程，请检查缓存文件是否因读写中断导致空文件错误')
+                print('[手动结束进程]')
             except Exception as e:
                 print('策略定时器出错：', e)
             finally:
                 self.delegate.shutdown()
+                try:
+                    import sys
+                    sys.exit(0)
+                except SystemExit:
+                    import os
+                    os._exit(0)
         else:
             # 旧版 schedule
             import schedule
@@ -734,21 +709,39 @@ class XtSubscriber(BaseSubscriber):
             #         schedule.run_pending()
             #         time.sleep(1)
             # except KeyboardInterrupt:
-            #     print('手动结束进程，请检查缓存文件是否因读写中断导致空文件错误')
+            #     print('[手动结束进程]')
             # finally:
             #     schedule.clear()
             #     self.delegate.shutdown()
 
+    def start_scheduler(self):
+        if self.use_ap_scheduler:
+            temp_now = datetime.datetime.now()
+            temp_date = temp_now.strftime('%Y-%m-%d')
+            temp_time = temp_now.strftime('%H:%M')
+            # 盘中执行需要补齐
+            if '08:05' < temp_time < '15:30' and check_is_open_day(temp_date):
+                self.before_trade_day_wrapper()
+                self.near_trade_begin_wrapper()
+                if '09:15' < temp_time < '11:30' or '13:00' <= temp_time < '14:57':
+                    self.subscribe_tick()  # 重启时如果在交易时间则订阅Tick
 
-# -----------------------
-# 检查是否交易日
-# -----------------------
-def prev_check_open_day():
-    now = datetime.datetime.now()
-    curr_date = now.strftime('%Y-%m-%d')
-    curr_time = now.strftime('%H:%M')
-    print(f'[{curr_time}]', end='')
-    check_is_open_day(curr_date)
+        if self.use_outside_data:
+            self.start_scheduler_without_qmt_data()
+            return
+        else:
+            self.start_scheduler_with_qmt_data()
+
+    # -----------------------
+    # 检查是否交易日
+    # -----------------------
+    def prev_check_open_day(self):
+        now = datetime.datetime.now()
+        curr_date = now.strftime('%Y-%m-%d')
+        curr_time = now.strftime('%H:%M')
+        print(f'[{curr_time}]', end='')
+        is_open_day = check_is_open_day(curr_date)
+        self.delegate.is_open_day = is_open_day
 
 
 # -----------------------
@@ -757,37 +750,31 @@ def prev_check_open_day():
 def update_position_held(lock: threading.Lock, delegate: XtDelegate, path: str):
     with lock:
         positions = delegate.check_positions()
+        held_info = load_json(path)
 
-        held_days = load_json(path)
-
-        # 添加未被缓存记录的持仓
+        # 添加未被缓存记录的持仓：默认当日买入
         for position in positions:
             if position.can_use_volume > 0:
-                if position.stock_code not in held_days.keys():
-                    held_days[position.stock_code] = 0
+                if position.stock_code not in held_info.keys():
+                    held_info[position.stock_code] = {InfoItem.DayCount: 0}
 
+        # 删除已清仓的held_info记录
         if positions is not None and len(positions) > 0:
-            # 删除已清仓的held_days记录
             position_codes = [position.stock_code for position in positions]
             print('当前持仓：', position_codes)
-            holding_codes = list(held_days.keys())
+            holding_codes = list(held_info.keys())
             for code in holding_codes:
-                if len(code) > 0 and code[0] != '_':
-                    if code not in position_codes:
-                        del held_days[code]
+                if len(code) > 0 and code[0] != '_' and (code not in position_codes):
+                    del held_info[code]
         else:
             print('当前空仓！')
 
-        save_json(path, held_days)
+        save_json(path, held_info)
 
 
 # -----------------------
-# 订阅单个股票历史N个分钟级K线
+# 临时获取quotes
 # -----------------------
-def sub_quote(
-    callback: Callable,
-    code: str,
-    count: int = -1,
-    period: str = '1m',
-):
-    xtdata.subscribe_quote(code, period=period, count=count, callback=callback)
+def xt_get_ticks(code_list: list[str]) -> dict[str, any]:
+    # http://docs.thinktrader.net/pages/36f5df/#%E8%8E%B7%E5%8F%96%E5%85%A8%E6%8E%A8%E6%95%B0%E6%8D%AE
+    return xtdata.get_full_tick(code_list)

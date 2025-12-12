@@ -1,47 +1,48 @@
+import os
 import csv
-import datetime
+
 import requests
-import numpy as np
-import pandas as pd
 from typing import Optional
 
-from tools.utils_basic import is_stock, is_fund_etf, code_to_symbol, tdxsymbol_to_code, code_to_tdxsymbol
-from tools.utils_cache import TRADE_DAY_CACHE_PATH
-from tools.utils_mootdx import MootdxClientInstance, get_offset_start, make_qfq, make_hfq
-
-from credentials import TDX_FOLDER
-
-
-DEFAULT_ZXG_FILE = TDX_FOLDER + r'\T0002\blocknew\ZXG.blk'     # 自选股文件
+from tools.constants import DataSource, ExitRight, DEFAULT_DAILY_COLUMNS
+from tools.utils_basic import *
+from tools.utils_miniqmt import get_qmt_daily_history
+from tools.utils_mootdx import MootdxClientInstance, get_mootdx_daily_history
 
 
-class DataSource:
-    AKSHARE = 'akshare'
-    TUSHARE = 'tushare'
-    MOOTDX = 'mootdx'
+def set_tdx_zxg_code(data: list[str], file_name: str = None, block_name: str = '自选股') -> None:
+    if file_name is None:
+        try:
+            from credentials import TDX_FOLDER
+            file_name = TDX_FOLDER + r'\T0002\blocknew\ZXG.blk'  # 自选股文件
+        except Exception as exception:
+            print('未找到tdx配置路径，放弃写入自选股', exception)
+            return
 
-
-class ExitRight:
-    BFQ = ''     # 不复权
-    QFQ = 'qfq'  # 前复权
-    HFQ = 'hfq'  # 后复权
-
-
-def set_tdx_zxg_code(data: list[str], filename: str = DEFAULT_ZXG_FILE):
-    # 打开或创建CSV文件并指定写入模式, newline=''则不生成空行
-    with open(filename, mode='w', newline='') as file:
+    with open(file_name, mode='w', newline='') as file:
         writer = csv.writer(file)
         for item in data:
             writer.writerow([code_to_tdxsymbol(item)])
-    print(f"已成功将数据写入{filename}文件！")
+    print(f'已成功将数据写入{block_name}文件：{file_name}')
 
 
-def get_tdx_zxg_code(filename: str = DEFAULT_ZXG_FILE) -> list[str]:
+def get_tdx_zxg_code(file_name: str = None) -> list[str]:
+    if file_name is None:
+        try:
+            from credentials import TDX_FOLDER
+            file_name = TDX_FOLDER + r'\T0002\blocknew\ZXG.blk'  # 自选股文件
+        except Exception as exception:
+            print('未找到tdx配置路径，放弃写入自选股', exception)
+            return []
+   
     ret_list = []
-    with open(filename) as f:
-        f_reader = csv.reader(f)
-        for row in f_reader:
-            ret_list.append(tdxsymbol_to_code(''.join(row)))
+    if os.path.isfile(file_name):
+        with open(file_name) as f:
+            f_reader = csv.reader(f)
+            for row in f_reader:
+                code = tdxsymbol_to_code(''.join(row))
+                if len(code) > 0:
+                    ret_list.append(code)
     return ret_list
 
 
@@ -50,7 +51,7 @@ def get_tdx_zxg_code(filename: str = DEFAULT_ZXG_FILE) -> list[str]:
 # ================
 
 
-def get_mootdx_quotes(code_list: list[str]):
+def get_mootdx_quotes(code_list: list[str]) -> dict[str, any]:
     if code_list is None or len(code_list) == 0:
         return {}
 
@@ -225,19 +226,43 @@ def get_ak_daily_history(
     code: str,
     start_date: str,  # format: 20240101
     end_date: str,
-    columns: list[str] = None,
+    columns: list[str] = DEFAULT_DAILY_COLUMNS,
     adjust: ExitRight = ExitRight.BFQ,
 ) -> Optional[pd.DataFrame]:
     import akshare as ak
     try:
         if is_stock(code):
-            df = ak.stock_zh_a_hist(
-                symbol=code_to_symbol(code),
+            # 东财容易封接口
+            # df = ak.stock_zh_a_hist(
+            #     symbol=code_to_symbol(code),
+            #     start_date=start_date,
+            #     end_date=end_date,
+            #     adjust=str(adjust),
+            #     period='daily',
+            # )
+            # if len(df) > 0:
+            #     df = df.rename(columns={
+            #         '日期': 'datetime',
+            #         '开盘': 'open',
+            #         '最高': 'high',
+            #         '最低': 'low',
+            #         '收盘': 'close',
+            #         '成交量': 'volume',
+            #         '成交额': 'amount',
+            #     })
+            #     df['datetime'] = pd.to_datetime(df['datetime']).dt.strftime('%Y%m%d')
+            #     df['datetime'] = df['datetime'].astype(int)
+
+            # 换成新浪的替代
+            df = ak.stock_zh_a_daily(
+                symbol=code_to_sina_symbol(code),
                 start_date=start_date,
                 end_date=end_date,
                 adjust=str(adjust),
-                period='daily',
             )
+            df['date'] = pd.to_datetime(df['date'], errors='coerce')
+            df = df.dropna(subset=['date']).copy()
+            df['datetime'] = df['date'].dt.strftime('%Y%m%d').astype(int)
         elif is_fund_etf(code):
             df = ak.fund_etf_hist_em(
                 symbol=code_to_symbol(code),
@@ -246,28 +271,27 @@ def get_ak_daily_history(
                 adjust=str(adjust),
                 period="daily",
             )
+            if len(df) > 0:
+                df = df.rename(columns={
+                    '日期': 'datetime',
+                    '开盘': 'open',
+                    '最高': 'high',
+                    '最低': 'low',
+                    '收盘': 'close',
+                    '成交量': 'volume',
+                    '成交额': 'amount',
+                })
+                df['datetime'] = pd.to_datetime(df['datetime']).dt.strftime('%Y%m%d')
+                df['datetime'] = df['datetime'].astype(int)
         else:
             return None
     except Exception as e:
         print(f' akshare get {code} error: ', e)
-        df = []
+        return None
 
-    if len(df) > 0:
-        df = df.rename(columns={
-            '日期': 'datetime',
-            '开盘': 'open',
-            '最高': 'high',
-            '最低': 'low',
-            '收盘': 'close',
-            '成交量': 'volume',
-            '成交额': 'amount',
-        })
-        df['datetime'] = pd.to_datetime(df['datetime']).dt.strftime('%Y%m%d')
-        df['datetime'] = df['datetime'].astype(int)
-        if columns is not None:
-            return df[columns]
-        return df
-    return None
+    if columns is not None:
+        return df[columns]
+    return df
 
 
 def _ts_to_standard(df: pd.DataFrame) -> pd.DataFrame:
@@ -287,11 +311,17 @@ def _ts_to_standard(df: pd.DataFrame) -> pd.DataFrame:
 # 使用 tushare 数据源记得 pip install tushare
 # 同时配置 tushare 的 token，在官网注册获取
 # https://tushare.pro/document/2?doc_id=27
+
+
+ACTIVE_TS_FQ = True  # 是否启用通用行情接口 https://tushare.pro/document/2?doc_id=109
+
+
 def get_ts_daily_history(
     code: str,
     start_date: str,  # format: 20240101
     end_date: str,
-    columns: list[str] = None,
+    columns: list[str] = DEFAULT_DAILY_COLUMNS,
+    adjust: ExitRight = ExitRight.BFQ,
 ) -> Optional[pd.DataFrame]:
     if not is_stock(code):
         return None
@@ -300,13 +330,76 @@ def get_ts_daily_history(
     try_times = 0
     df = None
     while (df is None or len(df) <= 0) and try_times < 3:
-        pro = get_tushare_pro()
         try_times += 1
-        df = pro.daily(
+
+        if ACTIVE_TS_FQ:
+            import warnings
+            warnings.filterwarnings('ignore', category=FutureWarning,
+                message=".*Series.fillna with 'method' is deprecated.*")  # 用.*匹配任意字符，关掉tushare内部warning
+
+            import tushare as ts
+            _ = get_tushare_pro()
+            df = ts.pro_bar(ts_code=code, start_date=start_date, end_date=end_date, adj=adjust)
+            df = df.drop_duplicates() if df is not None and len(df) > 0 else df
+        else:
+            pro = get_tushare_pro()
+            df = pro.daily(ts_code=code, start_date=start_date, end_date=end_date)
+
+    if df is not None and len(df) > 0:
+        df = _ts_to_standard(df)
+        if columns is not None:
+            return df[columns]
+        return df
+    return None
+
+
+# https://tushare.pro/document/2?doc_id=296
+# 可惜这个数据要氪金
+def get_ts_stk_daily_history(
+    code: str,
+    start_date: str,  # format: 20240101
+    end_date: str,
+    columns: list[str] = DEFAULT_DAILY_COLUMNS,
+    adjust: ExitRight = ExitRight.BFQ,
+) -> Optional[pd.DataFrame]:
+    if not is_stock(code):
+        return None
+
+    from reader.tushare_agent import get_tushare_pro
+    try_times = 0
+    df = None
+    while (df is None or len(df) <= 0) and try_times < 3:
+        try_times += 1
+
+        if adjust == ExitRight.BFQ:
+            suffix = ''
+        else:
+            suffix = f'_{adjust}'
+
+        pro = get_tushare_pro()
+        df = pro.stk_factor(
             ts_code=code,
             start_date=start_date,
             end_date=end_date,
+            fields=','.join([
+                'ts_code',
+                'trade_date',
+                f'open{suffix}',
+                f'close{suffix}',
+                f'high{suffix}',
+                f'low{suffix}',
+                f'pre_close{suffix}',
+                'vol',
+                'amount',
+            ])
         )
+        df = df.rename(columns={
+            f'open{suffix}': 'open',
+            f'close{suffix}': 'close',
+            f'high{suffix}': 'high',
+            f'low{suffix}': 'low',
+            f'pre_close{suffix}': 'pre_close',
+        })
 
     if df is not None and len(df) > 0:
         df = _ts_to_standard(df)
@@ -322,19 +415,34 @@ def get_ts_daily_histories(
     codes: list[str],
     start_date: str,    # format: 20240101
     end_date: str,
-    columns: list[str] = None,
+    columns: list[str] = DEFAULT_DAILY_COLUMNS,
+    adjust: ExitRight = ExitRight.BFQ,
 ) -> dict[str, pd.DataFrame]:
+    for code in codes:
+        if not is_stock(code):
+            print(f'存在不符合格式要求的code: {code}')
+            return {}
+
     from reader.tushare_agent import get_tushare_pro
+
     try_times = 0
     df = None
     while (df is None or len(df) <= 0) and try_times < 3:
-        pro = get_tushare_pro()
         try_times += 1
-        df = pro.daily(
-            ts_code=','.join(codes),
-            start_date=start_date,
-            end_date=end_date,
-        )
+
+        # tushare的通用行情 SDK 有bug，改回去了！
+        if ACTIVE_TS_FQ:
+            import warnings
+            warnings.filterwarnings('ignore', category=FutureWarning,
+                message=".*Series.fillna with 'method' is deprecated.*")  # 用.*匹配任意字符，关掉tushare内部warning
+
+            import tushare as ts
+            _ = get_tushare_pro()
+            df = ts.pro_bar(ts_code=','.join(codes), start_date=start_date, end_date=end_date, adj=adjust)
+            df = df.drop_duplicates() if df is not None and len(df) > 0 else df
+        else:
+            pro = get_tushare_pro()
+            df = pro.daily(ts_code=','.join(codes), start_date=start_date, end_date=end_date)
 
     ans = {}
     if df is not None and len(df) > 0:
@@ -349,88 +457,90 @@ def get_ts_daily_histories(
     return ans
 
 
-# 获取 mootdx 的历史日线
-# 使用 mootdx 数据源记得 pip install mootdx
-def get_mootdx_daily_history(
+# http://www.baostock.com
+def get_bao_daily_history(
     code: str,
     start_date: str,  # format: 20240101
     end_date: str,
-    columns: list[str] = None,
+    columns: list[str] = DEFAULT_DAILY_COLUMNS,
     adjust: ExitRight = ExitRight.BFQ,
 ) -> Optional[pd.DataFrame]:
-    offset, start = get_offset_start(TRADE_DAY_CACHE_PATH, start_date, end_date)
-    symbol = code_to_symbol(code)
+    start = f"{str(start_date)[:4]}-{str(start_date)[4:6]}-{str(start_date)[6:]}"
+    end = f"{str(end_date)[:4]}-{str(end_date)[4:6]}-{str(end_date)[6:]}"
 
-    client = MootdxClientInstance().client
-    try:
-        df = client.bars(
-            symbol=symbol,
-            frequency='day',
-            offset=offset,  # 总共N个K线
-            start=start,    # 向前数跳过几行
+    import baostock as bs
+    lg = bs.login()
+
+    if lg.error_code == '0':
+        # 1：后复权， 2：前复权，3：不复权
+        adjust_flag = '3'
+        if adjust == ExitRight.QFQ:
+            adjust_flag = '2'
+        elif adjust == ExitRight.HFQ:
+            adjust_flag = '1'
+
+        [symbol, exchange] = code.split('.')
+        rs = bs.query_history_k_data_plus(
+            f'{exchange.lower()}.{symbol}',
+            "date,code,open,high,low,close,volume,amount",
+            start_date=start,
+            end_date=end,
+            frequency='d',
+            adjustflag=adjust_flag,
         )
-        # TODO_List: 对于有些期间停牌过的票，发现时间对不上这里要校正，优先级不高因为只会多不会少
-    except Exception as e:
-        print(f' mootdx get daily {code} error: ', e)
-        return None
+        if rs.error_code == '0':
+            data_list = []
+            while (rs.error_code == '0') & rs.next():
+                data_list.append(rs.get_row_data())
 
-    if adjust != ExitRight.BFQ:
-        try:
-            xdxr = client.xdxr(symbol=symbol)
-            if xdxr is not None and len(xdxr) > 0:
-                xdxr['date_str'] = xdxr['year'].astype(str) + \
-                    '-' + xdxr['month'].astype(str).str.zfill(2) + \
-                    '-' + xdxr['day'].astype(str).str.zfill(2)
-                xdxr['datetime'] = pd.to_datetime(xdxr['date_str'] + ' 15:00:00')
-                xdxr = xdxr.set_index('datetime')
+            bs.logout()
 
-                if adjust == ExitRight.QFQ:
-                    df = make_qfq(df, xdxr)
-                elif adjust == ExitRight.HFQ:
-                    df = make_hfq(df, xdxr)
-        except Exception as e:
-            print(f' mootdx get xdxr {code} error: ', e)
-            return None
-
-    if df is not None and len(df) > 0 and type(df) == pd.DataFrame and 'datetime' in df.columns:
-        try:
-            df = df.replace([np.inf, -np.inf], np.nan).dropna()  # 然后删除所有包含 NaN 的行
-            df['datetime'] = pd.to_datetime(df['datetime'])
-            df['datetime'] = df['datetime'].dt.date.astype(str).str.replace('-', '').astype(int)
-            df = pd.concat([df['datetime'], df.drop('datetime', axis=1)], axis=1)
-
-            df = df.drop(columns='volume')
-            df = df.rename(columns={'vol': 'volume'})
+            df = pd.DataFrame(data_list, columns=rs.fields)
+            df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y%m%d').astype(int)
+            df = df.rename(columns={'date': 'datetime'})
+            df['datetime'] = df['datetime'].astype(int)
+            df['open'] = df['open'].astype(float)
+            df['high'] = df['high'].astype(float)
+            df['low'] = df['low'].astype(float)
+            df['close'] = df['close'].astype(float)
             df['volume'] = df['volume'].astype(int)
-            df = df.reset_index(drop=True)
+            df['amount'] = df['amount'].astype(float)
 
-            if columns is not None:
-                return df[columns]
-            return df
-        except Exception as e:
-            print(f' handle format {code} error: ', e)
+            if df is not None and len(df) > 0:
+                if columns is not None:
+                    return df[columns]
+                return df
             return None
-    return None
+        else:
+            print(f'query_history_k_data_plus {code} respond error_msg:' + rs.error_msg)
+        return None
+    else:
+        print('login respond error_msg:' + lg.error_msg)
+        return None
 
 
 def get_daily_history(
     code: str,
     start_date: str,  # format: 20240101
     end_date: str,
-    columns: list[str] = None,
+    columns: list[str] = DEFAULT_DAILY_COLUMNS,
     adjust: ExitRight = ExitRight.BFQ,
-    data_source=DataSource.AKSHARE,
+    data_source: DataSource = DataSource.TUSHARE,
 ) -> Optional[pd.DataFrame]:
     if data_source == DataSource.TUSHARE:
-        # TuShare 的数据免费的暂时不支持复权
-        # TuShare 不支持 etf，其他两个支持
+        # TuShare 不支持 etf，其他两个支持，但也注意daily_history 不支持 etf
         return get_ts_daily_history(code, start_date, end_date, columns)
     elif data_source == DataSource.MOOTDX:
         # Mootdx 的复权是先截断数据然后复权，取三位小数
         # 暂时不支持 920xxx 的北交所股票数据
         # 其它北交所股票小部分有发行脏数据情况
         return get_mootdx_daily_history(code, start_date, end_date, columns, adjust)
-    else:
+    elif data_source == DataSource.AKSHARE:
         # AkShare 的复权是针对全部历史复权后截取，取两位小数
         # Akshare 的 etf 取三位小数，成交量略有不同
         return get_ak_daily_history(code, start_date, end_date, columns, adjust)
+    elif data_source == DataSource.BAOSTOCK:
+        return get_bao_daily_history(code, start_date, end_date, columns, adjust)
+    else:
+        # 默认使用免费的 miniqmt数据，但就是慢的一批
+        return get_qmt_daily_history(code, start_date, end_date, columns, adjust)

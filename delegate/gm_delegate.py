@@ -1,6 +1,7 @@
 """
 https://sim.myquant.cn/sim/help/Python.html
 """
+import datetime
 from typing import List
 
 from gmtrade.api import *
@@ -11,17 +12,20 @@ from delegate.gm_callback import GmCallback
 
 from credentials import GM_ACCOUNT_ID, GM_CLIENT_TOKEN
 
+from tools.constants import MSG_OUTER_SEPARATOR, MSG_INNER_SEPARATOR
 from tools.utils_basic import code_to_gmsymbol, gmsymbol_to_code
+from tools.utils_cache import StockNames
 from tools.utils_ding import BaseMessager
 
 
-GM_SERVER_HOST = 'api.myquant.cn:9000'
+DEFAULT_GM_SERVER_HOST = 'api.myquant.cn:9000'
+DEFAULT_GM_STRATEGY_NAME = '模拟策略'
 
 
 class GmAsset:
-    def __init__(self, cash: Cash):
+    def __init__(self, cash: Cash, account_id: str = ''):
         self.account_type = 0
-        self.account_id = cash.account_id
+        self.account_id = account_id
         self.cash = round(cash.available, 3)
         self.frozen_cash = round(cash.order_frozen, 3)
         self.market_value = round(cash.frozen, 3)
@@ -50,12 +54,19 @@ class GmPosition:
 
 
 class GmDelegate(BaseDelegate):
-    def __init__(self, account_id: str = None, callback: GmCallback = None, ding_messager: BaseMessager = None):
+    def __init__(
+        self,
+        account_id: str = None,
+        callback: GmCallback = None,
+        ding_messager: BaseMessager = None,
+    ):
         super().__init__()
-        self.account_id = '**' + str(account_id)[-4:]
         self.ding_messager = ding_messager
+        self.stock_names = StockNames()
 
-        set_endpoint(GM_SERVER_HOST)
+        self.account_id = '**' + str(account_id)[-4:]
+
+        set_endpoint(DEFAULT_GM_SERVER_HOST)
         set_token(GM_CLIENT_TOKEN)
 
         self.account = account(account_id=GM_ACCOUNT_ID, account_alias='')
@@ -70,7 +81,7 @@ class GmDelegate(BaseDelegate):
 
     def check_asset(self) -> GmAsset:
         cash: Cash = get_cash(self.account)
-        return GmAsset(cash)
+        return GmAsset(cash, GM_ACCOUNT_ID)
 
     def check_orders(self) -> List[GmOrder]:
         orders = get_orders(self.account)
@@ -86,7 +97,7 @@ class GmDelegate(BaseDelegate):
         price: float,
         volume: int,
         remark: str,
-        strategy_name: str = 'non-name',
+        strategy_name: str = DEFAULT_GM_STRATEGY_NAME,
     ):
         """
         [
@@ -112,13 +123,6 @@ class GmDelegate(BaseDelegate):
             }
         ]
         """
-        print(f'[{remark}]{code}')
-        if self.ding_messager is not None:
-            self.ding_messager.send_text_as_md(
-                f'[{self.account_id}]{strategy_name} {remark}\n'
-                f'{code}市买{volume}股{price:.2f}元',
-                '')
-
         orders = order_volume(
             symbol=code_to_gmsymbol(code),
             price=price,
@@ -128,6 +132,14 @@ class GmDelegate(BaseDelegate):
             order_qualifier=OrderQualifier_B5TC,
             position_effect=PositionEffect_Open,
         )
+        print(f'[{remark}]{code}')
+        if self.ding_messager is not None:
+            name = self.stock_names.get_name(code)
+            self.ding_messager.send_text_as_md(
+                f'[{self.account_id}]{strategy_name} {remark}{MSG_OUTER_SEPARATOR}'
+                f'{datetime.datetime.now().strftime("%H:%M:%S")} 市买 {code}{MSG_INNER_SEPARATOR}'
+                f'{name} {volume}股 {price:.2f}元',
+                '[MB]')
         return orders
 
     def order_market_close(
@@ -136,15 +148,8 @@ class GmDelegate(BaseDelegate):
         price: float,
         volume: int,
         remark: str,
-        strategy_name: str = 'non-name',
+        strategy_name: str = DEFAULT_GM_STRATEGY_NAME,
     ):
-        print(f'[{remark}]{code}')
-        if self.ding_messager is not None:
-            self.ding_messager.send_text_as_md(
-                f'[{self.account_id}]{strategy_name} {remark}\n'
-                f'{code}市卖{volume}股{price:.2f}元',
-                '')
-
         orders = order_volume(
             symbol=code_to_gmsymbol(code),
             price=price,
@@ -154,6 +159,14 @@ class GmDelegate(BaseDelegate):
             order_qualifier=OrderQualifier_B5TC,
             position_effect=PositionEffect_Close,
         )
+        print(f'[{remark}]{code}')
+        if self.ding_messager is not None:
+            name = self.stock_names.get_name(code)
+            self.ding_messager.send_text_as_md(
+                f'[{self.account_id}]{strategy_name} {remark}{MSG_OUTER_SEPARATOR}'
+                f'{datetime.datetime.now().strftime("%H:%M:%S")} 市卖 {code}{MSG_INNER_SEPARATOR}'
+                f'{name} {volume}股 {price:.2f}元',
+                '[MS]')
         return orders
 
     def order_limit_open(
@@ -162,7 +175,7 @@ class GmDelegate(BaseDelegate):
         price: float,
         volume: int,
         remark: str,
-        strategy_name: str = 'non-name',
+        strategy_name: str = DEFAULT_GM_STRATEGY_NAME,
     ):
         """
         [
@@ -188,13 +201,6 @@ class GmDelegate(BaseDelegate):
             }
         ]
         """
-        print(f'[{remark}]{code}')
-        if self.ding_messager is not None:
-            self.ding_messager.send_text_as_md(
-                f'[{self.account_id}]{strategy_name} {remark}\n'
-                f'{code}限买{volume}股{price:.2f}元',
-                '')
-
         orders = order_volume(
             symbol=code_to_gmsymbol(code),
             price=price,
@@ -203,6 +209,14 @@ class GmDelegate(BaseDelegate):
             order_type=OrderType_Limit,
             position_effect=PositionEffect_Open,
         )
+        print(f'[{remark}]{code}')
+        if self.ding_messager is not None:
+            name = self.stock_names.get_name(code)
+            self.ding_messager.send_text_as_md(
+                f'[{self.account_id}]{strategy_name} {remark}{MSG_OUTER_SEPARATOR}'
+                f'{datetime.datetime.now().strftime("%H:%M:%S")} 限买 {code}{MSG_INNER_SEPARATOR}'
+                f'{name} {volume}股 {price:.2f}元',
+                '[LB]')
         return orders
 
     def order_limit_close(
@@ -211,15 +225,8 @@ class GmDelegate(BaseDelegate):
         price: float,
         volume: int,
         remark: str,
-        strategy_name: str = 'non-name',
+        strategy_name: str = DEFAULT_GM_STRATEGY_NAME,
     ):
-        print(f'[{remark}]{code}')
-        if self.ding_messager is not None:
-            self.ding_messager.send_text_as_md(
-                f'[{self.account_id}]{strategy_name} {remark}\n'
-                f'{code}限卖{volume}股{price:.2f}元',
-                '')
-
         orders = order_volume(
             symbol=code_to_gmsymbol(code),
             price=price,
@@ -228,9 +235,21 @@ class GmDelegate(BaseDelegate):
             order_type=OrderType_Limit,
             position_effect=PositionEffect_Close,
         )
+        print(f'[{remark}]{code}')
+        if self.ding_messager is not None:
+            name = self.stock_names.get_name(code)
+            self.ding_messager.send_text_as_md(
+                f'[{self.account_id}]{strategy_name} {remark}{MSG_OUTER_SEPARATOR}'
+                f'{datetime.datetime.now().strftime("%H:%M:%S")} 限卖 {code}{MSG_INNER_SEPARATOR}'
+                f'{name} {volume}股 {price:.2f}元',
+                '[LS]')
         return orders
 
-    def order_cancel_all(self):
+    def order_cancel_all(self, strategy_name: str = DEFAULT_GM_STRATEGY_NAME):
+        if self.ding_messager is not None:
+            self.ding_messager.send_text_as_md(
+                f'{datetime.datetime.now().strftime("%H:%M:%S")} 全撤'
+                '[CA]')
         order_cancel_all()
 
     # order_1 = {'symbol': 'SHSE.600000', 'cl_ord_id': 'cl_ord_id_1', 'price': 11, 'side': 1, 'order_type': 1}
@@ -238,7 +257,14 @@ class GmDelegate(BaseDelegate):
     # orders = [order_1, order_2]
     # order_cancel(wait_cancel_orders=orders)
 
-    def order_cancel_buy(self, code: str):
+    def order_cancel_buy(self, code: str, strategy_name: str = DEFAULT_GM_STRATEGY_NAME):
+        if self.ding_messager is not None:
+            name = self.stock_names.get_name(code)
+            self.ding_messager.send_text_as_md(
+                f'[{self.account_id}]{strategy_name} {name}{MSG_OUTER_SEPARATOR}'
+                f'{datetime.datetime.now().strftime("%H:%M:%S")} 撤买 {code}'
+                '[CB]')
+
         orders = get_orders()
         candidate = []
         for order in orders:
@@ -249,7 +275,14 @@ class GmDelegate(BaseDelegate):
                 })
         order_cancel(candidate)
 
-    def order_cancel_sell(self, code: str):
+    def order_cancel_sell(self, code: str, strategy_name: str = DEFAULT_GM_STRATEGY_NAME):
+        if self.ding_messager is not None:
+            name = self.stock_names.get_name(code)
+            self.ding_messager.send_text_as_md(
+                f'[{self.account_id}]{strategy_name} {name}{MSG_OUTER_SEPARATOR}'
+                f'{datetime.datetime.now().strftime("%H:%M:%S")} 撤卖 {code}'
+                '[CS]')
+
         orders = get_orders()
         candidate = []
         for order in orders:
@@ -260,10 +293,9 @@ class GmDelegate(BaseDelegate):
                 })
         order_cancel(candidate)
 
+    @staticmethod
+    def is_position_holding(position: GmPosition) -> bool:
+        return position.volume > 0
 
-def is_position_holding(position: GmPosition) -> bool:
-    return position.volume > 0
-
-
-def get_holding_position_count(positions: List[GmPosition]) -> int:
-    return sum(1 for position in positions if is_position_holding(position))
+    def get_holding_position_count(self, positions: List[GmPosition]) -> int:
+        return sum(1 for position in positions if self.is_position_holding(position))
